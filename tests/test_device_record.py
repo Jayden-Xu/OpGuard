@@ -17,7 +17,7 @@ import torch.nn.functional as F
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA device required")
 
-from opguard.device_record import DeviceRecorder, ReadbackResult  # noqa: E402
+from opguard.device_record import DeviceRecorder  # noqa: E402
 from opguard.tracer.xor_signature import xor_signature  # noqa: E402
 
 DEV = torch.device("cuda", 0)
@@ -242,9 +242,8 @@ def test_empty_tensor_list_commits(make_rec):
 # ---------------------------------------------- 3/4/5. graph, call ids, epochs
 
 
-@pytest.mark.parametrize("double_buffer", [True, False])
-def test_graph_replay_records_every_probe(make_rec, double_buffer):
-    rec = make_rec(MODEL_T, capacity=64, double_buffer=double_buffer)
+def test_graph_replay_records_every_probe(make_rec):
+    rec = make_rec(MODEL_T, capacity=64)
     model = Model()
     warm_model(model)
     graph, probed = capture(rec, model.forward)
@@ -353,16 +352,15 @@ def test_too_many_tensors_names_site(make_rec):
 # ------------------------------------------------------ 8. lazy allocation
 
 
-@pytest.mark.parametrize("double_buffer", [True, False])
-def test_late_allocation_and_growth(make_rec, double_buffer):
-    rec = make_rec(MODEL_T, capacity=0, double_buffer=double_buffer)
+def test_late_allocation_and_growth(make_rec):
+    rec = make_rec(MODEL_T, capacity=0)
     model = Model()
     warm_model(model)
     graph_a, probed_a = capture(rec, model.forward)
-    ring_bytes_before = rec.memory_bytes()
+    assert rec.ring_desc.tolist() == [0, 0]
     expected = {}
     replay_and_expect(rec, graph_a, probed_a, expected, model.new_input)
-    assert rec.memory_bytes() > ring_bytes_before  # allocated on first replay
+    assert rec.ring_desc[1].item() == 7  # allocated on the first replay, sized for it
     replay_and_expect(rec, graph_a, probed_a, expected, model.new_input)
 
     graph_b, probed_b = capture(rec, lambda probe: sum((model.forward(probe) for _ in range(5)), []))
@@ -381,9 +379,8 @@ def test_late_allocation_and_growth(make_rec, double_buffer):
 # ------------------------------------------------------ 9. overflow fallback
 
 
-@pytest.mark.parametrize("double_buffer", [True, False])
-def test_overflow_fallback(make_rec, double_buffer):
-    rec = make_rec(MODEL_T, capacity=16, overflow_check=False, double_buffer=double_buffer)
+def test_overflow_fallback(make_rec):
+    rec = make_rec(MODEL_T, capacity=16, overflow_check=False)
     model = Model()
     warm_model(model)
     graph, probed = capture(rec, lambda probe: sum((model.forward(probe) for _ in range(5)), []))
@@ -402,16 +399,10 @@ def test_overflow_fallback(make_rec, double_buffer):
 # ---------------------------------------------- 10. concurrent copy and write
 
 
-SNAP_CAP, SNAP_WIDE, SNAP_SLEEP, SNAP_REPLAYS = 64, 64, 200_000, 3
-
-
 @isolated
 def test_snap_readback_under_concurrent_writes(make_rec):
-    P, C = 32, 0x0123456789ABCDEF
-    cap, wide, sleep_cycles, replays_per_cycle = SNAP_CAP, SNAP_WIDE, SNAP_SLEEP, SNAP_REPLAYS
-    # An extra never-probed site with many tensors makes each slot ~1 KB, so the
-    # ring copy is long enough to overlap with commits that lap the ring.
-    rec = make_rec([1] * P + [wide], capacity=cap, double_buffer=False, overflow_check=False)
+    P, C, replays_per_cycle = 32, 0x0123456789ABCDEF, 3
+    rec = make_rec([1] * P, capacity=2 * replays_per_cycle * P)
     sites = torch.arange(P, device=DEV)
     const = torch.full((P,), C, dtype=torch.int64, device=DEV)
 
@@ -426,38 +417,23 @@ def test_snap_readback_under_concurrent_writes(make_rec):
     lo32 = lambda a: (a & 0xFFFFFFFF).astype(np.uint32)
     hi32 = lambda a: ((a >> 32) & 0xFFFFFFFF).astype(np.uint32)
 
-    def wrong(s, site, k, call_id, epoch, fp):
-        """Records whose content does not belong to sequence number s."""
-        exp_epoch = s // P + 1
-        exp_site = s % P
+    def wrong(res):
+        """Records whose content does not belong to their sequence number."""
+        epoch, site, fp = res.replay_epoch, res.site, res.fingerprints[:, 0, :]
+        exp_epoch = res.s // P + 1
+        exp_site = res.s % P
         v = epoch * 1000 + site
-        bad = (epoch != exp_epoch) | (site != exp_site) | (k != exp_epoch - 1) | (call_id != ids[exp_site])
+        bad = (epoch != exp_epoch) | (site != exp_site) | (res.k != exp_epoch - 1)
+        bad |= res.call_id != ids[exp_site]
         bad |= (fp[:, 0] != lo32(v)) | (fp[:, 1] != hi32(v))
         bad |= (fp[:, 2] != np.uint32(C & 0xFFFFFFFF)) | (fp[:, 3] != np.uint32(C >> 32))
-        return bad
+        return int(bad.sum())
 
-    seq_only = {"accepted": 0, "wrong": 0}
-    progress = []  # c1 - c0: how far the writer got past the snapshot by the end of the copy
-
-    def raw_hook(slots, last, c0, c1, cap_, swapped):
-        progress.append(c1 - c0)
-        s = np.arange(last, c0, dtype=np.int64)
-        rows = slots[s % cap_]
-        ok = rows[:, 0] == s
-        rows, s = rows[ok], s[ok]
-        fp = rows[:, 6:8].copy().view(np.uint32).reshape(-1, 4)
-        seq_only["accepted"] += len(s)
-        seq_only["wrong"] += int(wrong(s, rows[:, 1], rows[:, 3], rows[:, 4], rows[:, 5], fp).sum())
-
-    rec._debug_raw_hook = raw_hook
-    rec._debug_copy_sleep_cycles = sleep_cycles
-    total, accepted, false_accept, rejected_c1, lost = 0, 0, 0, 0, 0
-    deadline = time.monotonic() + 300
+    total = accepted = lost = false_accept = readbacks = during = max_during = 0
     while total < 1_000_000:
-        assert time.monotonic() < deadline, (total, sleep_cycles, rejected_c1)
-        # Replays before the readback keep the GPU backlogged, so the replays issued
-        # after it are already queued when the snapshot point is reached; the race
-        # then depends on GPU timing only (copy-stream sleep vs. commit rate).
+        # Replays issued before the readback keep the GPU busy, so the replays issued
+        # after it are already queued when the snapshot point is reached and their
+        # commits run while the copy stream copies the ring that was switched out.
         for _ in range(replays_per_cycle):
             rec.replay(graph)
         handle = rec.readback_async()
@@ -465,30 +441,18 @@ def test_snap_readback_under_concurrent_writes(make_rec):
             rec.replay(graph)
         total += 2 * replays_per_cycle * P
         res = rec.collect(handle)
-        if len(progress) >= 16:
-            # Keep the writer about half a ring ahead when the copy runs.
-            median = float(np.median(progress))
-            if median < cap / 4:
-                sleep_cycles = min(int(sleep_cycles * 1.25) + 1000, 5_000_000)
-            elif median > 3 * cap / 4:
-                sleep_cycles = max(1000, int(sleep_cycles * 0.8))
-            rec._debug_copy_sleep_cycles = sleep_cycles
-            progress.clear()
-        accepted += len(res)
-        lost += res.lost
-        rejected_c1 += res.rejected_by_c1
-        fp = res.fingerprints[:, 0, :]
-        false_accept += int(wrong(res.s, res.site, res.k, res.call_id, res.replay_epoch, fp).sum())
+        accepted, lost, false_accept = accepted + len(res), lost + res.lost, false_accept + wrong(res)
+        readbacks += res.readbacks
+        during += res.written_during_copy
+        max_during = max(max_during, res.written_during_copy)
     res = rec.readback()
-    accepted += len(res)
-    lost += res.lost
-    false_accept += int(wrong(res.s, res.site, res.k, res.call_id, res.replay_epoch, res.fingerprints[:, 0, :]).sum())
-    print(f"\n[snap] calls={total} accepted={accepted} lost={lost} rejected_by_c1={rejected_c1} "
-          f"false_accept={false_accept} seq_only_accepted={seq_only['accepted']} "
-          f"seq_only_wrong={seq_only['wrong']} final_sleep_cycles={sleep_cycles}")
-    assert accepted + lost == total
+    accepted, lost, false_accept = accepted + len(res), lost + res.lost, false_accept + wrong(res)
+    readbacks += res.readbacks
+    print(f"\n[snap] calls={total} readbacks={readbacks} accepted={accepted} lost={lost} "
+          f"false_accept={false_accept} written_during_copy={during} max_per_readback={max_during}")
+    assert accepted == total and lost == 0
     assert false_accept == 0
-    assert rejected_c1 > 0  # the copy really raced with writes
+    assert during > 0  # commits really ran while rings were being copied
 
 
 # --------------------------------------------------------- 11. multi stream
@@ -584,12 +548,11 @@ def test_reentrant_on_call(make_rec):
     assert sorted(res.call_id.tolist()) == sorted(cid for _, cid in seen)
 
 
-@pytest.mark.parametrize("capacity,double_buffer", [(0, True), (0, False), (4, False)],
-                         ids=["allocate-double", "allocate-single", "readback-single"])
-def test_other_thread_waits_for_capture(make_rec, capacity, double_buffer):
+@pytest.mark.parametrize("capacity", [0, 4], ids=["allocate", "switch"])
+def test_other_thread_waits_for_capture(make_rec, capacity):
     # capacity 0: B's eager probe must allocate the ring; capacity 4 (full): it
-    # must read back first. Either needs CUDA calls that would break A's capture.
-    rec = make_rec(MODEL_T, capacity=capacity, double_buffer=double_buffer)
+    # must switch rings and read back. Either could break A's capture.
+    rec = make_rec(MODEL_T, capacity=capacity)
     model = Model()
     warm_model(model)
     side = torch.cuda.Stream()
@@ -597,7 +560,7 @@ def test_other_thread_waits_for_capture(make_rec, capacity, double_buffer):
     for _ in range(capacity):
         rec.probe([t], 0)
     torch.cuda.synchronize()
-    mem_before = rec.memory_bytes()
+    assert rec.ring_desc[1].item() == capacity
     in_capture, b_done = threading.Event(), threading.Event()
     out = {}
 
@@ -629,7 +592,7 @@ def test_other_thread_waits_for_capture(make_rec, capacity, double_buffer):
     assert "capture" in out["readback_error"]
     assert out["waited"] >= 0.3
     if capacity == 0:
-        assert rec.memory_bytes() > mem_before  # B allocated only after the capture
+        assert rec.ring_desc[1].item() > 0  # B allocated only after the capture
     rec.on_call = None
     probed = dict(zip([cid for cid, c in ids if c], probed))
     expected = {}
@@ -645,7 +608,7 @@ def test_other_thread_waits_for_capture(make_rec, capacity, double_buffer):
 
 
 def test_capture_wait_timeout(make_rec):
-    rec = make_rec([1], capacity=2, double_buffer=False, capture_wait_timeout=0.3)
+    rec = make_rec([1], capacity=2, capture_wait_timeout=0.3)
     side = torch.cuda.Stream()
     t = torch.randn(64, device=DEV)
     rec.probe([t], 0)
@@ -693,22 +656,3 @@ def test_recapture_replaces_bound_count(make_rec):
         rec.replay(graph)
     res = rec.readback()
     assert len(res) == 1 + 27 and res.lost == 0 and len(res.placeholder_k) == 0
-
-
-def test_reset_and_memory_bytes(make_rec):
-    rec = make_rec([2, 1], capacity=8)
-    t = torch.randn(10, device=DEV)
-    for _ in range(5):
-        rec.probe([t], 0)
-    mem = rec.memory_bytes()
-    assert mem > 0
-    rec.reset()
-    assert rec.memory_bytes() == mem
-    rec.probe([t], 1)
-    res = rec.readback()
-    assert len(res) == 1 and res.s.tolist() == [0] and res.k.tolist() == [0] and res.lost == 0
-
-
-def test_result_is_numpy():
-    empty = ReadbackResult.empty(3)
-    assert empty.fingerprints.shape == (0, 3, 4) and empty.fingerprints.dtype == np.uint32
