@@ -4,8 +4,14 @@ Each ``opguard::probe`` call fingerprints its CUDA tensors on the GPU and
 commits one slot of a record ring in device memory. Because recording is GPU
 work inside an operator, CUDA graph replays re-run it. The host reserves ring
 space before issuing work (so records are normally never overwritten) and
-reads the ring back with the snap protocol, which accepts only slots that are
-provably complete and not overwritten; every other call becomes a placeholder.
+reads rings back with the snap protocol; every call whose slot is not
+accepted becomes a placeholder.
+
+Two rings alternate. A readback first switches ``ring_desc`` to the other ring
+on the compute stream and then records the event the copy waits for, so the
+ring being read is never written again: commits after the event go to the
+other ring, and slots overwritten by a later lap before the event fail the
+``seq == s`` check. Growing the ring is the same switch.
 
 Readback safe point
 -------------------
@@ -28,7 +34,7 @@ import contextlib
 import threading
 import time
 import weakref
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Callable, Optional, Sequence
 
 import numpy as np
@@ -60,10 +66,10 @@ class ReadbackResult:
 
     ``fingerprints[i, j]`` is the 4-word fingerprint of tensor ``j`` of record
     ``i``; entries ``j >= n[i]`` are zero. Placeholders identify lost calls by
-    ``(site, k)``. ``lost`` counts sequence numbers that were not accepted and
-    always equals ``len(placeholder_k)``. ``rejected_by_c1`` counts slots whose
-    sequence number matched but which were rejected because they may have been
-    overwritten while being copied.
+    ``(site, k)``; ``lost`` (calls not accepted) always equals
+    ``len(placeholder_k)``. ``written_during_copy`` is statistics only: the
+    number of commits that happened between the snapshot and the end of the
+    copy (summed ``c1 - c0``); those went to the other ring.
     """
 
     s: np.ndarray
@@ -76,7 +82,7 @@ class ReadbackResult:
     placeholder_site: np.ndarray
     placeholder_k: np.ndarray
     lost: int = 0
-    rejected_by_c1: int = 0
+    written_during_copy: int = 0
     readbacks: int = 0
 
     _RECORD_FIELDS = ("s", "site", "n", "k", "call_id", "replay_epoch", "fingerprints")
@@ -89,7 +95,7 @@ class ReadbackResult:
         picked = {name: getattr(self, name)[index] for name in self._RECORD_FIELDS}
         return ReadbackResult(**picked, placeholder_site=self.placeholder_site,
                               placeholder_k=self.placeholder_k, lost=self.lost,
-                              rejected_by_c1=self.rejected_by_c1, readbacks=self.readbacks)
+                              written_during_copy=self.written_during_copy, readbacks=self.readbacks)
 
     @classmethod
     def empty(cls, t_max: int) -> "ReadbackResult":
@@ -106,41 +112,45 @@ class ReadbackResult:
         return cls(*(cat(name) for name in cls._RECORD_FIELDS),
                    placeholder_site=cat("placeholder_site"), placeholder_k=cat("placeholder_k"),
                    lost=sum(r.lost for r in results),
-                   rejected_by_c1=sum(r.rejected_by_c1 for r in results),
+                   written_during_copy=sum(r.written_during_copy for r in results),
                    readbacks=sum(r.readbacks for r in results))
 
 
 # --------------------------------------------------------------- ring blocks
 
 class _Block:
-    """One record ring in device memory with its pinned host mirror.
+    """One record ring with everything a readback of it needs.
 
-    ``desc`` is this block's own device-side ``[address, capacity]``; switching
-    blocks copies it into ``ring_desc`` device-to-device on the compute stream.
-    At most one readback of a block is pending at a time (it owns ``host``).
+    ``desc`` is this ring's own device-side ``[address, capacity]``; switching
+    copies it into ``ring_desc`` device-to-device on the compute stream.
+    ``snap`` (device) and the pinned ``host``/``snap_host``/``c1_host`` belong to
+    this ring's readback. At most one readback of a ring is pending at a time:
+    the ring is only switched back to after that readback was collected.
     """
 
-    __slots__ = ("ring", "desc", "host", "cap", "pending", "retired")
+    __slots__ = ("ring", "desc", "snap", "host", "snap_host", "c1_host", "cap", "pending")
 
-    def __init__(self, ring, desc, host, cap):
-        self.ring, self.desc, self.host, self.cap = ring, desc, host, cap
+    def __init__(self, cap: int, slot_words: int, num_sites: int, device):
+        i64 = dict(dtype=torch.int64, device=device)
+        self.ring = torch.zeros((cap, slot_words), **i64)
+        self.ring[:, 0] = -1  # otherwise slot 0 would look like a valid record number 0
+        self.desc = torch.tensor([self.ring.data_ptr(), cap], **i64)
+        self.snap = torch.zeros(1 + num_sites, **i64)
+        self.host = torch.empty((cap, slot_words), dtype=torch.int64, pin_memory=True)
+        self.snap_host = torch.empty(1 + num_sites, dtype=torch.int64, pin_memory=True)
+        self.c1_host = torch.empty(1, dtype=torch.int64, pin_memory=True)
+        self.cap = cap
         self.pending: Optional[ReadbackHandle] = None
-        self.retired = False
-
-    def nbytes(self) -> int:
-        return self.ring.numel() * 8 + self.desc.numel() * 8
 
 
 class ReadbackHandle:
-    """An issued, not yet collected readback. Collect it with ``DeviceRecorder.collect``."""
+    """An issued readback. Collect it with ``DeviceRecorder.collect``."""
 
-    __slots__ = ("block", "swapped", "snap_host", "c1_host", "event", "done", "__weakref__")
+    __slots__ = ("block", "event", "done")
 
-    def __init__(self, block, swapped, snap_host, c1_host):
-        self.block, self.swapped = block, swapped
-        self.snap_host, self.c1_host = snap_host, c1_host
-        self.event = None
-        self.done = False
+    def __init__(self, block: Optional[_Block], event=None):
+        self.block, self.event = block, event
+        self.done = block is None  # nothing to read before any ring exists
 
 
 # ------------------------------------------------------------------- recorder
@@ -151,28 +161,28 @@ class DeviceRecorder:
     Args:
         device: CUDA device.
         tensors_per_site: ``T[i]``, the maximum number of tensors site ``i`` probes.
-        capacity: initial ring capacity in slots; 0 allocates on first need
-            (which may be after graphs were captured).
-        double_buffer: alternate between two rings (default). Otherwise one
-            ring, read back in place.
+        capacity: initial capacity of each of the two rings, in slots; 0
+            allocates on first need (which may be after graphs were captured).
         replays_per_readback: when space is allocated for a graph replay, size
             the ring for this many replays.
         capture_wait_timeout: seconds an operation that needs readback or
             allocation waits for another thread's capture to finish.
         overflow_check: reserve space before issuing work (default). Only tests
-            turn this off, to exercise the snap/placeholder fallback.
+            turn this off, to exercise the placeholder fallback.
         on_call: optional ``on_call(site, call_id, tensors, capturing)``,
             invoked (without the recorder lock) before the call's kernels are
-            issued. May itself call ``probe``.
+            issued. It may itself call ``probe``. If the probe fails after the
+            callback returned (for example, waiting for another thread's
+            capture timed out), the call produces no record and the exception
+            propagates to the caller.
 
     All state except the rings is allocated here, before any capture, and is
     only ever modified in place afterwards: captured graphs keep its addresses.
     """
 
     def __init__(self, device, tensors_per_site: Sequence[int], capacity: int = 0,
-                 double_buffer: bool = True, replays_per_readback: int = 1,
-                 capture_wait_timeout: float = 60.0, overflow_check: bool = True,
-                 on_call: Optional[Callable] = None):
+                 replays_per_readback: int = 1, capture_wait_timeout: float = 60.0,
+                 overflow_check: bool = True, on_call: Optional[Callable] = None):
         self.device = torch.device("cuda", _op._device_index(device))
         T = [int(t) for t in tensors_per_site]
         if not T or min(T) < 0:
@@ -187,7 +197,6 @@ class DeviceRecorder:
         self._scratch_offsets = [0] * len(T)
         for i in range(1, len(T)):
             self._scratch_offsets[i] = self._scratch_offsets[i - 1] + 4 * T[i - 1]
-        self.double_buffer = bool(double_buffer)
         self.replays_per_readback = int(replays_per_readback)
         self.capture_wait_timeout = float(capture_wait_timeout)
         self.overflow_check = bool(overflow_check)
@@ -201,7 +210,6 @@ class DeviceRecorder:
             self.enable = torch.ones(self.num_sites, dtype=torch.int32, device=self.device)
             self.replay_epoch = torch.zeros(1, **i64)
             self.ring_desc = torch.zeros(2, **i64)
-            self.snapshot = torch.zeros(1 + self.num_sites, **i64)
             self._copy_stream = torch.cuda.Stream(self.device)
 
         self._cond = threading.Condition(threading.RLock())
@@ -212,27 +220,19 @@ class DeviceRecorder:
         self._host_epoch = 0
         self._blocks: list[Optional[_Block]] = [None, None]
         self._cur = 0
-        self._issued = 0      # calls issued into the current block since it was (re)started
-        self._reserved = 0    # single buffer: slots still being copied by a pending readback
+        self._issued = 0  # calls issued into the current ring since it became current
         self._pending: "collections.deque[ReadbackHandle]" = collections.deque()
-        self._last_copy_event = None
         self._last = 0
         self._expected_k = np.zeros(self.num_sites, dtype=np.int64)
         self._unreported: list[ReadbackResult] = []
         self._closed = False
-        # Test-only hooks.
-        self._debug_raw_hook = None          # fn(slots, last, c0, c1, cap, swapped)
-        self._debug_copy_sleep_cycles = 0    # delay the ring copy on the copy stream
 
         _op.register(self)
         try:
             with torch.cuda.device(self.device):
                 if capacity:
-                    block = self._new_block(int(capacity))
-                    self.ring_desc.copy_(block.desc)
-                    self._blocks[0] = block
-                    if self.double_buffer:
-                        self._blocks[1] = self._new_block(int(capacity))
+                    self._blocks = [self._new_block(int(capacity)), self._new_block(int(capacity))]
+                    self.ring_desc.copy_(self._blocks[0].desc)
                 # State must be initialised before any stream (or capture) uses it.
                 torch.cuda.current_stream(self.device).synchronize()
         except BaseException:
@@ -302,21 +302,17 @@ class DeviceRecorder:
             self.enable[site:site + 1].fill_(1 if enabled else 0)
 
     def readback_async(self, join_streams: Sequence[torch.cuda.Stream] = ()) -> ReadbackHandle:
-        """Issue a readback on the current stream; collect it later with ``collect``.
+        """Switch rings and issue the readback of the old one; collect it later with ``collect``.
 
         Must be called at a safe point (see the module docstring); streams in
-        ``join_streams`` are joined into the current stream first. With double
-        buffering this switches rings.
+        ``join_streams`` are joined into the current stream first.
         """
         with self._cond:
             self._check_explicit_readback()
+            if self._blocks[self._cur] is None:
+                return ReadbackHandle(None)
             with torch.cuda.device(self.device):
-                if self.double_buffer and self._blocks[self._cur] is not None:
-                    return self._switch(0, False, join_streams)
-                block = self._blocks[self._cur]
-                if block is not None and block.pending is not None:
-                    self._collect_through(block.pending)
-                return self._issue_readback(None, join_streams)
+                return self._switch(0, False, join_streams)
 
     def collect(self, handle: ReadbackHandle) -> ReadbackResult:
         """Wait for ``handle`` (and earlier readbacks); return everything collected since last reported."""
@@ -330,41 +326,6 @@ class DeviceRecorder:
         with self._cond:
             return self.collect(self.readback_async(join_streams))
 
-    def reset(self) -> None:
-        """Zero counters and scratch, invalidate ring slots and host counts, in place (no reallocation).
-
-        Site switches and graph bindings are kept; call ids keep increasing.
-        """
-        with self._cond:
-            self._check_explicit_readback()
-            with torch.cuda.device(self.device):
-                for handle in self._pending:
-                    handle.event.synchronize()
-                    self._finish_handle(handle)
-                self._pending.clear()
-                stream = torch.cuda.current_stream(self.device)
-                if self._last_copy_event is not None:
-                    stream.wait_event(self._last_copy_event)
-                for t in (self.cursor, self.site_counters, self.scratch, self.replay_epoch, self.snapshot):
-                    t.zero_()
-                for block in self._blocks:
-                    if block is not None:
-                        block.ring[:, 0].fill_(-1)
-                stream.synchronize()
-            self._issued = self._reserved = self._last = self._host_epoch = 0
-            self._expected_k[:] = 0
-            self._unreported.clear()
-
-    def memory_bytes(self) -> int:
-        """Device memory held: rings (including ones awaiting collection), scratch and state."""
-        with self._cond:
-            state = (self.cursor, self.site_counters, self.scratch, self.enable,
-                     self.replay_epoch, self.ring_desc, self.snapshot)
-            total = sum(t.numel() * t.element_size() for t in state)
-            blocks = {id(b): b for b in self._blocks if b is not None}
-            blocks.update({id(h.block): h.block for h in self._pending if h.block is not None})
-            return total + sum(b.nbytes() for b in blocks.values())
-
     def close(self) -> None:
         """Finish pending copies, release the rings and unregister from the device."""
         with self._cond:
@@ -373,7 +334,7 @@ class DeviceRecorder:
             self._closed = True
             for handle in self._pending:
                 handle.event.synchronize()
-                self._finish_handle(handle)
+                handle.done = True
             self._pending.clear()
             for block in self._blocks:
                 if block is not None:
@@ -434,11 +395,7 @@ class DeviceRecorder:
         block = self._blocks[self._cur]
         if block is None:
             return True
-        if not self.overflow_check:
-            return False
-        if self.double_buffer:
-            return self._issued + n > block.cap
-        return n > block.cap or self._issued + n + self._reserved > block.cap
+        return self.overflow_check and self._issued + n > block.cap
 
     def _ensure_space(self, n: int, for_replay: bool) -> None:
         """Make room for ``n`` calls about to be issued. Lock held."""
@@ -446,29 +403,11 @@ class DeviceRecorder:
             self._wait_for_captures()  # may release the lock; re-check afterwards
             if not self._needs_space(n):
                 break
-            self._make_space(n, for_replay)
+            self._switch(n, for_replay, ())
         self._issued += n
 
-    def _make_space(self, n: int, for_replay: bool) -> None:
-        if self.double_buffer:
-            self._switch(n, for_replay, ())
-            return
-        block = self._blocks[self._cur]
-        if block is None or n > block.cap:
-            if block is not None and block.pending is not None:
-                self._collect_through(block.pending)
-            new = self._new_block(self._grow_cap(n, for_replay, block.cap if block else 0))
-            self._issue_readback(new, ())   # the old block is swapped out ...
-            if block is not None:
-                block.retired = True        # ... and freed once its copy is collected
-            self._blocks[self._cur] = new
-        elif block.pending is not None:
-            self._collect_through(block.pending)
-        else:
-            self._collect_through(self._issue_readback(None, ()))
-
     def _switch(self, n: int, for_replay: bool, join_streams) -> ReadbackHandle:
-        """Double buffering: read the current ring back and continue in the other one."""
+        """Continue in the other ring (grown if it cannot hold ``n``) and read the current one back."""
         cur = self._blocks[self._cur]
         other_index = 1 - self._cur
         other = self._blocks[other_index]
@@ -481,8 +420,14 @@ class DeviceRecorder:
             if other is not None:
                 self._free_block(other)
             other = self._blocks[other_index] = self._new_block(target)
-        handle = self._issue_readback(other, join_streams)
+        if cur is None:
+            # No ring existed, so no commit can have written one: just install it.
+            self.ring_desc.copy_(other.desc)
+            handle = ReadbackHandle(None)
+        else:
+            handle = self._issue_readback(cur, other, join_streams)
         self._cur = other_index
+        self._issued = 0
         return handle
 
     def _grow_cap(self, n: int, for_replay: bool, old: int) -> int:
@@ -491,15 +436,12 @@ class DeviceRecorder:
         return max(n, 2 * old, MIN_EAGER_CAPACITY)
 
     def _new_block(self, cap: int) -> _Block:
-        ring = torch.zeros((cap, self.slot_words), dtype=torch.int64, device=self.device)
-        ring[:, 0] = -1  # otherwise slot 0 would look like a valid record number 0
-        desc = torch.tensor([ring.data_ptr(), cap], dtype=torch.int64, device=self.device)
-        host = torch.empty((cap, self.slot_words), dtype=torch.int64, pin_memory=True)
-        return _Block(ring, desc, host, cap)
+        return _Block(cap, self.slot_words, self.num_sites, self.device)
 
     def _free_block(self, block: _Block) -> None:
         block.ring.record_stream(self._copy_stream)
-        block.ring = block.desc = block.host = None
+        block.snap.record_stream(self._copy_stream)
+        block.ring = block.desc = block.snap = block.host = block.snap_host = block.c1_host = None
 
     def _wait_for_captures(self) -> None:
         """Wait (lock released, no CUDA calls) until no capture of this recorder is in progress."""
@@ -519,43 +461,30 @@ class DeviceRecorder:
 
     # ------------------------------------------------------------- readback
 
-    def _issue_readback(self, swap_to: Optional[_Block], join_streams) -> ReadbackHandle:
-        """Snap protocol steps 1-5. Lock held, no capture in progress."""
+    def _issue_readback(self, block: _Block, next_block: _Block, join_streams) -> ReadbackHandle:
+        """Snap protocol steps 1-5 for ``block``, switching to ``next_block``. Lock held, no capture."""
+        assert block.pending is None  # its previous readback was collected before switching back
         stream = torch.cuda.current_stream(self.device)
         for side in join_streams:
             joined = torch.cuda.Event()
             joined.record(side)
             stream.wait_event(joined)
-        if self._last_copy_event is not None:
-            stream.wait_event(self._last_copy_event)  # the snapshot buffer is reused
-        self.snapshot[:1].copy_(self.cursor)
-        self.snapshot[1:].copy_(self.site_counters)
-        block = self._blocks[self._cur]
-        if swap_to is not None:
-            self.ring_desc.copy_(swap_to.desc)
+        block.snap[:1].copy_(self.cursor)
+        block.snap[1:].copy_(self.site_counters)
+        self.ring_desc.copy_(next_block.desc)  # commits after the event write next_block
         snapped = torch.cuda.Event()
         snapped.record(stream)
-        handle = ReadbackHandle(block, swap_to is not None,
-                                torch.empty(1 + self.num_sites, dtype=torch.int64, pin_memory=True),
-                                torch.empty(1, dtype=torch.int64, pin_memory=True))
         copy = self._copy_stream
         with torch.cuda.stream(copy):
             copy.wait_event(snapped)
-            handle.snap_host.copy_(self.snapshot, non_blocking=True)
-            if self._debug_copy_sleep_cycles:
-                torch.cuda._sleep(int(self._debug_copy_sleep_cycles))
-            if block is not None:
-                block.host.copy_(block.ring, non_blocking=True)
-            handle.c1_host.copy_(self.cursor, non_blocking=True)
-            handle.event = torch.cuda.Event()
-            handle.event.record(copy)
-        self._last_copy_event = handle.event
-        if block is not None:
-            block.pending = handle
-        if swap_to is not None:
-            self._issued = self._reserved = 0
-        else:
-            self._reserved, self._issued = self._issued, 0
+            block.snap_host.copy_(block.snap, non_blocking=True)
+            block.host.copy_(block.ring, non_blocking=True)
+            # Statistics only: c1 - c0 is how many commits (into next_block) ran
+            # while this ring was copied. It plays no part in accepting slots.
+            block.c1_host.copy_(self.cursor, non_blocking=True)
+            done = torch.cuda.Event()
+            done.record(copy)
+        handle = block.pending = ReadbackHandle(block, done)
         self._pending.append(handle)
         return handle
 
@@ -564,47 +493,22 @@ class DeviceRecorder:
         while not handle.done:
             head = self._pending.popleft()
             head.event.synchronize()
-            self._unreported.append(self._parse(head))
-            self._finish_handle(head)
+            self._unreported.append(self._parse(head.block))
+            head.done = True
+            head.block.pending = None
 
-    def _finish_handle(self, handle: ReadbackHandle) -> None:
-        handle.done = True
-        block = handle.block
-        if block is not None:
-            block.pending = None
-            if block.retired:
-                self._free_block(block)
-            elif not handle.swapped and block is self._blocks[self._cur]:
-                self._reserved = 0
-
-    def _parse(self, handle: ReadbackHandle) -> ReadbackResult:
+    def _parse(self, block: _Block) -> ReadbackResult:
         """Snap protocol steps 6-7 plus loss detection, vectorized with numpy."""
-        snap = handle.snap_host.numpy().copy()
+        snap = block.snap_host.numpy().copy()
         c0, counts = int(snap[0]), snap[1:]
-        c1 = int(handle.c1_host.numpy()[0])
+        c1 = int(block.c1_host.numpy()[0])
         last = self._last
         if c0 < last or (counts < self._expected_k).any():
             raise RuntimeError("opguard device recorder: counters went backwards (internal error)")
         seqs = np.arange(last, c0, dtype=np.int64)
-        block = handle.block
-        cap = block.cap if block is not None else 0
-        rejected = 0
-        if cap and seqs.size:
-            slots = block.host.numpy()
-            if self._debug_raw_hook is not None:
-                self._debug_raw_hook(slots, last, c0, c1, cap, handle.swapped)
-            rows = slots[seqs % cap]
-            ok = rows[:, 0] == seqs
-            if not handle.swapped:
-                # The ring may still be written after the snapshot: a write of number
-                # s + cap claims its number first, so c1 > s + cap exposes it.
-                fresh = seqs >= c1 - cap
-                rejected = int(np.count_nonzero(ok & ~fresh))
-                ok &= fresh
-            rows, seqs = rows[ok], seqs[ok]
-        else:
-            rows = np.zeros((0, self.slot_words), dtype=np.int64)
-            seqs = seqs[:0]
+        rows = block.host.numpy()[seqs % block.cap]
+        ok = rows[:, 0] == seqs  # the ring is not written after the snapshot
+        rows, seqs = rows[ok], seqs[ok]
         site, n, k = rows[:, 1].copy(), rows[:, 2].copy(), rows[:, 3].copy()
         if site.size:
             if site.min() < 0 or site.max() >= self.num_sites:
@@ -620,7 +524,7 @@ class DeviceRecorder:
         self._last = c0
         return ReadbackResult(seqs, site, n, k, rows[:, 4].copy(), rows[:, 5].copy(), fingerprints,
                               ph_site, ph_k, lost=int(c0 - last - len(seqs)),
-                              rejected_by_c1=rejected, readbacks=1)
+                              written_during_copy=c1 - c0, readbacks=1)
 
     def _placeholders(self, site, k, counts):
         """Per-site gaps between the expected k, the accepted records and the snapshot count."""
