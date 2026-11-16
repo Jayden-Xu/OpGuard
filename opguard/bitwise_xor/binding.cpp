@@ -3,17 +3,23 @@
 #include <ATen/cuda/CUDAContext.h>
 #include <c10/cuda/CUDAStream.h>
 #include <c10/cuda/CUDAGuard.h>   // <-- needed for c10::cuda::CUDAGuard
+#include <c10/cuda/CUDAException.h>
 #include <cuda_runtime_api.h>
 
 #include <unordered_map>
 #include <mutex>
 #include <cstdint>
 #include <algorithm>
+#include <vector>
 
 // C-linkage wrappers from the .cu file
 extern "C" void xor_first_pass_auto_or_small(const uint8_t*,  uint32_t*, uint32_t*, size_t, int, int, cudaStream_t);
 extern "C" void xor_words_auto_or_small     (const uint32_t*, uint32_t*, uint32_t*, size_t, int, int, cudaStream_t);
 extern "C" void xor_regional_launch(const uint8_t*, uint32_t*, uint32_t*, size_t, int, int, cudaStream_t);
+// Device-side recorder launchers (device_record_kernel.cu)
+extern "C" void dr_launch_xor(const uint8_t*, uint64_t, uint32_t*, const int32_t*, int64_t, cudaStream_t);
+extern "C" void dr_launch_commit(int64_t, int64_t, int64_t, int64_t, int64_t, const int64_t*, int64_t*,
+                                 int64_t*, uint32_t*, const int32_t*, const int64_t*, cudaStream_t);
 
 // constants local to binding
 static constexpr int BLOCK_SIZE = 256;
@@ -177,10 +183,67 @@ at::Tensor xor_reduce_regional_cuda(at::Tensor bytes, int64_t regions) {
     return out;
 }
 
+// ---------- device-side recorder (opguard/device_record) ----------
+// Launches one fingerprint kernel per non-empty tensor and then exactly one
+// commit kernel, all on the current stream of the state tensors' device. The
+// Python operator validates arguments first, so a call is never half-issued.
+// Every tensor here is used through its address only; nothing is allocated.
+static void device_record_probe(const std::vector<at::Tensor>& tensors, int64_t site,
+                                int64_t scratch_offset, int64_t t_site, int64_t call_id,
+                                int64_t slot_words, const at::Tensor& ring_desc,
+                                const at::Tensor& cursor, const at::Tensor& site_counters,
+                                const at::Tensor& scratch, const at::Tensor& enable,
+                                const at::Tensor& replay_epoch) {
+    const auto dev = cursor.device();
+    auto check = [&](const at::Tensor& t, at::ScalarType dtype, const char* name) {
+        TORCH_CHECK(t.is_cuda() && t.device() == dev && t.scalar_type() == dtype && t.is_contiguous(),
+                    "opguard::probe: ", name, " must be a contiguous ", c10::toString(dtype),
+                    " tensor on ", dev);
+    };
+    check(ring_desc, at::kLong, "ring_desc");
+    check(cursor, at::kLong, "cursor");
+    check(site_counters, at::kLong, "site_counters");
+    check(scratch, at::kInt, "scratch");
+    check(enable, at::kInt, "enable");
+    check(replay_epoch, at::kLong, "replay_epoch");
+    TORCH_CHECK(ring_desc.numel() >= 2 && cursor.numel() >= 1 && replay_epoch.numel() >= 1,
+                "opguard::probe: malformed recorder state");
+    TORCH_CHECK(site >= 0 && site < site_counters.numel() && site < enable.numel(),
+                "opguard::probe: site ", site, " out of range");
+    const int64_t n = static_cast<int64_t>(tensors.size());
+    TORCH_CHECK(n <= t_site, "opguard::probe: site ", site, " got ", n, " tensors, limit ", t_site);
+    TORCH_CHECK(scratch_offset >= 0 && scratch_offset + 4 * t_site <= scratch.numel(),
+                "opguard::probe: scratch range out of bounds for site ", site);
+    TORCH_CHECK(slot_words >= 6 + 2 * t_site, "opguard::probe: slot too small for site ", site);
+    for (const auto& t : tensors) {
+        TORCH_CHECK(t.is_cuda() && t.device() == dev && t.is_contiguous(),
+                    "opguard::probe: site ", site, ": tensors must be contiguous and on ", dev);
+    }
+
+    c10::cuda::CUDAGuard guard(dev);
+    const cudaStream_t stream = at::cuda::getCurrentCUDAStream(dev.index()).stream();
+    uint32_t* site_scratch = reinterpret_cast<uint32_t*>(scratch.data_ptr<int32_t>()) + scratch_offset;
+    const int32_t* enable_ptr = enable.data_ptr<int32_t>();
+    for (int64_t j = 0; j < n; ++j) {
+        const auto& t = tensors[j];
+        const uint64_t nbytes = static_cast<uint64_t>(t.numel()) * t.element_size();
+        if (nbytes == 0) continue;
+        dr_launch_xor(static_cast<const uint8_t*>(t.data_ptr()), nbytes, site_scratch + 4 * j,
+                      enable_ptr, site, stream);
+        C10_CUDA_KERNEL_LAUNCH_CHECK();
+    }
+    dr_launch_commit(site, n, t_site, call_id, slot_words, ring_desc.data_ptr<int64_t>(),
+                     cursor.data_ptr<int64_t>(), site_counters.data_ptr<int64_t>(), site_scratch,
+                     enable_ptr, replay_epoch.data_ptr<int64_t>(), stream);
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("xor_reduce_regional_cuda", &xor_reduce_regional_cuda,
           "Fixed flat-word regional XOR on current stream (no host synchronization)");
     m.def("xor_reduce_cuda",       &xor_reduce_cuda,       "XOR reduce (bytes, cached workspace) on current stream");
     m.def("xor_reduce_words_cuda", &xor_reduce_words_cuda, "XOR reduce (u32, cached workspace) on current stream");
     m.def("clear_xor_workspace_cache", &clear_workspace_cache, "Clear cached workspaces");
+    m.def("device_record_probe", &device_record_probe,
+          "Device-side recorder: fingerprint kernels plus one commit kernel on the current stream");
 }

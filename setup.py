@@ -51,7 +51,8 @@ if xor_enabled or callsite_enabled:
     if xor_enabled:
         ext_modules.append(CUDAExtension(
             "xor_reduce_cuda",
-            ["opguard/bitwise_xor/bitwise_xor_kernel.cu", "opguard/bitwise_xor/binding.cpp"],
+            ["opguard/bitwise_xor/bitwise_xor_kernel.cu", "opguard/bitwise_xor/device_record_kernel.cu",
+             "opguard/bitwise_xor/binding.cpp"],
             extra_compile_args={"cxx": ["-O3"], "nvcc": ["-O3"]},
             runtime_library_dirs=rpaths("."),
         ))

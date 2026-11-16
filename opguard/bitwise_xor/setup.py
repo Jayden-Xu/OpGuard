@@ -9,6 +9,7 @@ setup(
             sources=[
                 "binding.cpp",
                 "bitwise_xor_kernel.cu",
+                "device_record_kernel.cu",
             ],
             extra_compile_args={
                 "cxx": ["-O3"],
